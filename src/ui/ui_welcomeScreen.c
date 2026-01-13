@@ -16,7 +16,7 @@ lv_obj_set_height( ui_welcomeLabel, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_welcomeLabel, 0 );
 lv_obj_set_y( ui_welcomeLabel, -12 );
 lv_obj_set_align( ui_welcomeLabel, LV_ALIGN_CENTER );
-lv_label_set_text(ui_welcomeLabel,"Weclcome to Shottimer\n\n						Starting ....");
+lv_label_set_text(ui_welcomeLabel,"Welcome to Shottimer\n\n						Starting ....");
 lv_obj_set_style_text_font(ui_welcomeLabel, &lv_font_montserrat_22, LV_PART_MAIN| LV_STATE_DEFAULT);
 
 

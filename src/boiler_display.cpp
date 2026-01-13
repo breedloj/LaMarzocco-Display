@@ -662,4 +662,3 @@ static void restart_update_timer(void) {
 static const char* boiler_type_name(BoilerType type) {
     return (type == BOILER_COFFEE) ? "Coffee" : "Steam";
 }
-

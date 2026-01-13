@@ -197,13 +197,15 @@ void LaMarzoccoMachine::_websocket_message_handler(const String& message) {
             char steam_level_str[16] = "";
             
             if (coffee_target_temp > 0) {
-                snprintf(coffee_temp_str, sizeof(coffee_temp_str), "%.0f°C", coffee_target_temp);
+                float tempF = (coffee_target_temp * 9.0f / 5.0f) + 32.0f;
+
+                snprintf(coffee_temp_str, sizeof(coffee_temp_str), "%.1f°F", tempF);
             }
             
             if (steam_target_level) {
                 // Convert "Level2" to "L2", "Level1" to "L1", etc.
                 if (strncmp(steam_target_level, "Level", 5) == 0) {
-                    snprintf(steam_level_str, sizeof(steam_level_str), "L%s", steam_target_level + 5);
+                    snprintf(steam_level_str, sizeof(steam_level_str), "Level %s", steam_target_level + 5);
                 } else {
                     strncpy(steam_level_str, steam_target_level, sizeof(steam_level_str) - 1);
                 }

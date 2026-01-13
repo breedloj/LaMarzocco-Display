@@ -131,8 +131,6 @@ void setup()
 
   updateSerialLoggingPowerState(true);
 
-  activity_monitor_init(USER_INACTIVITY_TIMEOUT_MS, MACHINE_INACTIVITY_TIMEOUT_MS);
-
   gui_mutex = xSemaphoreCreateMutex();
   if (gui_mutex == NULL)
   {

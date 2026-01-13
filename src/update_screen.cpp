@@ -21,6 +21,8 @@ bool updateDateTime(void)
         return false;
 
     struct tm timeinfo;
+    setenv("TZ","PST8PDT,M3.2.0,M11.1.0",1);
+    tzset();
     if (!getLocalTime(&timeinfo))
     {
         log_e("Failed to obtain time");
@@ -29,9 +31,16 @@ bool updateDateTime(void)
 
     char timeStr[32];
 
-    snprintf(timeStr, sizeof(timeStr), "%02d : %02d",
-             timeinfo.tm_hour,
-             timeinfo.tm_min);
+    int hour24 = timeinfo.tm_hour;
+    int hour12 = hour24 % 12;
+    if (hour12 == 0) {
+        hour12 = 12;
+    }
+
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d %s",
+            hour12,
+            timeinfo.tm_min,
+            (hour24 >= 12) ? "PM" : "AM");
 
     // Update label with mutex protection
     if (gui_mutex && xSemaphoreTake(gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -167,7 +176,6 @@ void updateStatusImages(void)
     // OR if this is the first initialization
     if (!statusImagesInitialized || (millis() - statusUpdate >= TIME_UPDATE))
     {
-        updateBatteryImages();
         updateWiFiImages();
         
         statusUpdate = millis();

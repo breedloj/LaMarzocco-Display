@@ -16,7 +16,7 @@ ui_WifiImage = lv_img_create(ui_mainScreen);
 lv_img_set_src(ui_WifiImage, &ui_img_wifi0_png);
 lv_obj_set_width( ui_WifiImage, LV_SIZE_CONTENT);  /// 1
 lv_obj_set_height( ui_WifiImage, LV_SIZE_CONTENT);   /// 1
-lv_obj_set_x( ui_WifiImage, 156 );
+lv_obj_set_x( ui_WifiImage, 212 );
 lv_obj_set_y( ui_WifiImage, -94 );
 lv_obj_set_align( ui_WifiImage, LV_ALIGN_CENTER );
 lv_obj_add_flag( ui_WifiImage, LV_OBJ_FLAG_HIDDEN | LV_OBJ_FLAG_ADV_HITTEST );   /// Flags
@@ -62,9 +62,9 @@ lv_obj_set_style_shadow_color(ui_steamButton, lv_color_hex(0xFFFFFF), LV_PART_MA
 lv_obj_set_style_shadow_opa(ui_steamButton, 255, LV_PART_MAIN| LV_STATE_DEFAULT);
 
 ui_timeLabel = lv_label_create(ui_mainScreen);
-lv_obj_set_width( ui_timeLabel, 92);
+lv_obj_set_width( ui_timeLabel, 125);
 lv_obj_set_height( ui_timeLabel, 27);
-lv_obj_set_x( ui_timeLabel, -208 );
+lv_obj_set_x( ui_timeLabel, -190 );
 lv_obj_set_y( ui_timeLabel, -95 );
 lv_obj_set_align( ui_timeLabel, LV_ALIGN_CENTER );
 lv_label_set_text(ui_timeLabel,"");
@@ -142,7 +142,7 @@ lv_label_set_text(ui_SteamLabel,"OFF");
 lv_obj_set_style_text_font(ui_SteamLabel, &lv_font_montserrat_26, LV_PART_MAIN| LV_STATE_DEFAULT);
 
 ui_CoffeeTempLabel = lv_label_create(ui_mainScreen);
-lv_obj_set_width( ui_CoffeeTempLabel, 42);
+lv_obj_set_width( ui_CoffeeTempLabel, 60);
 lv_obj_set_height( ui_CoffeeTempLabel, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_CoffeeTempLabel, -159 );
 lv_obj_set_y( ui_CoffeeTempLabel, 88 );
@@ -151,7 +151,7 @@ lv_label_set_text(ui_CoffeeTempLabel,"");
 lv_obj_set_style_text_align(ui_CoffeeTempLabel, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN| LV_STATE_DEFAULT);
 
 ui_BoilerTempLabel = lv_label_create(ui_mainScreen);
-lv_obj_set_width( ui_BoilerTempLabel, lv_pct(8));
+lv_obj_set_width( ui_BoilerTempLabel, 60);
 lv_obj_set_height( ui_BoilerTempLabel, LV_SIZE_CONTENT);   /// 1
 lv_obj_set_x( ui_BoilerTempLabel, 34 );
 lv_obj_set_y( ui_BoilerTempLabel, 83 );
