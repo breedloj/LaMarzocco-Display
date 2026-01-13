@@ -37,10 +37,9 @@ bool updateDateTime(void)
         hour12 = 12;
     }
 
-    snprintf(timeStr, sizeof(timeStr), "%02d:%02d %s",
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d",
             hour12,
-            timeinfo.tm_min,
-            (hour24 >= 12) ? "PM" : "AM");
+            timeinfo.tm_min);
 
     // Update label with mutex protection
     if (gui_mutex && xSemaphoreTake(gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
