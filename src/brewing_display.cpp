@@ -1,6 +1,7 @@
 #include "brewing_display.h"
 #include "water_alarm.h"
 #include "config.h"
+#include "display_power.h"
 #include "ui/ui.h"
 #include <Arduino.h>
 #include <string.h>
@@ -34,6 +35,7 @@ static int g_final_seconds = 0;  // Final seconds value to flash
 static lv_timer_t* g_update_timer = NULL;
 static bool g_timer_paused = true;
 static SemaphoreHandle_t g_gui_mutex = NULL;
+static portMUX_TYPE g_state_mux = portMUX_INITIALIZER_UNLOCKED;
 static unsigned long g_flash_start_time = 0;
 static const unsigned long FLASH_DURATION_MS = 3000;  // 3 seconds
 static const unsigned long FLASH_TOGGLE_MS = 200;     // Flash toggle every 200ms
@@ -49,9 +51,10 @@ static void restore_normal_ui(void);
 static void restore_normal_ui_no_mutex(void);  // Version without mutex for timer callback
 static void start_brewing(int64_t start_time);
 static void stop_brewing(void);
+static BrewingState brewing_state_snapshot(void);
 
 // Helper macro for mutex protection
-#define TAKE_MUTEX() if (g_gui_mutex && xSemaphoreTake(g_gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+#define TAKE_MUTEX() if (g_gui_mutex && xSemaphoreTake(g_gui_mutex, portMAX_DELAY) == pdTRUE)
 #define GIVE_MUTEX() if (g_gui_mutex) xSemaphoreGive(g_gui_mutex)
 
 /**
@@ -103,10 +106,13 @@ void brewing_display_init(void) {
     }
     g_timer_paused = true;
     
-    g_initialized = true;
+    portENTER_CRITICAL(&g_state_mux);
     g_state = BREWING_STATE_IDLE;
     g_brewing_start_time = 0;
     g_final_seconds = 0;
+    g_flash_start_time = 0;
+    portEXIT_CRITICAL(&g_state_mux);
+    g_initialized = true;
     brewing_debugln("[Brewing] Initialization complete");
 }
 
@@ -114,30 +120,41 @@ void brewing_display_init(void) {
  * Start brewing mode
  */
 static void start_brewing(int64_t start_time) {
+    portENTER_CRITICAL(&g_state_mux);
     if (g_state == BREWING_STATE_ACTIVE) {
         // Already brewing, just update start time if different
         if (start_time != g_brewing_start_time) {
             g_brewing_start_time = start_time;
         }
+        portEXIT_CRITICAL(&g_state_mux);
         return;
     }
-    
-    brewing_debugln("[Brewing] ===== STARTING BREWING MODE =====");
-    g_state = BREWING_STATE_ACTIVE;
+
     g_brewing_start_time = start_time;
     g_final_seconds = 0;
+    g_state = BREWING_STATE_ACTIVE;
+    portEXIT_CRITICAL(&g_state_mux);
+
+    brewing_debugln("[Brewing] ===== STARTING BREWING MODE =====");
+
+    // A shot is one of the key events the display exists to show. This also
+    // covers the local GPIO simulation path without relying on WebSocket state.
+    display_power_mark_machine_activity();
     
     // Show brewing UI (sets initial 0.0 display)
     show_brewing_ui();
     
     // Start/resume timer for real-time updates (50ms = 20 updates/sec)
-    if (g_update_timer) {
-        lv_timer_set_period(g_update_timer, 50);
-        if (g_timer_paused) {
-            lv_timer_resume(g_update_timer);
-            g_timer_paused = false;
-            brewing_debugln("[Brewing] Timer started (50ms period)");
+    TAKE_MUTEX() {
+        if (g_update_timer) {
+            lv_timer_set_period(g_update_timer, 50);
+            if (g_timer_paused) {
+                lv_timer_resume(g_update_timer);
+                g_timer_paused = false;
+                brewing_debugln("[Brewing] Timer started (50ms period)");
+            }
         }
+        GIVE_MUTEX();
     }
 }
 
@@ -145,36 +162,38 @@ static void start_brewing(int64_t start_time) {
  * Stop brewing mode
  */
 static void stop_brewing(void) {
-    if (g_state == BREWING_STATE_IDLE) {
-        return;  // Already stopped
+    const int64_t now_ms = brewing_display_get_current_time_ms();
+    int final_seconds = 0;
+
+    portENTER_CRITICAL(&g_state_mux);
+    if (g_state != BREWING_STATE_ACTIVE) {
+        portEXIT_CRITICAL(&g_state_mux);
+        // Repeated non-brewing dashboard frames must not restart the final-time
+        // flash window or overwrite its captured shot duration.
+        return;
     }
-    
+
+    if (g_brewing_start_time > 0) {
+        const int64_t elapsed_ms = now_ms - g_brewing_start_time;
+        if (elapsed_ms > 0) {
+            final_seconds = static_cast<int>(elapsed_ms / 1000);
+        }
+    }
+
+    g_final_seconds = final_seconds;
+    g_flash_start_time = millis();
+    g_brewing_start_time = 0;
+    g_state = BREWING_STATE_FLASHING;
+    portEXIT_CRITICAL(&g_state_mux);
+
     brewing_debugln("[Brewing] ===== STOPPING BREWING MODE =====");
     
-    // Capture final seconds value for flashing
-    if (g_brewing_start_time > 0) {
-        int64_t now_ms = brewing_display_get_current_time_ms();
-        int64_t elapsed_ms = now_ms - g_brewing_start_time;
-        if (elapsed_ms > 0) {
-            g_final_seconds = (int)(elapsed_ms / 1000);
-        } else {
-            g_final_seconds = 0;
-        }
-    } else {
-        g_final_seconds = 0;
-    }
-    
     brewing_debug("[Brewing] Final seconds to flash: ");
-    brewing_debugln(g_final_seconds);
-    
-    // Transition to flashing state
-    g_state = BREWING_STATE_FLASHING;
-    g_flash_start_time = millis();
-    g_brewing_start_time = 0;  // Clear start time to stop timer updates
+    brewing_debugln(final_seconds);
     
     // Update display to show only seconds (no tenths) for flashing
     char seconds_str[16];
-    snprintf(seconds_str, sizeof(seconds_str), "%d", g_final_seconds);
+    snprintf(seconds_str, sizeof(seconds_str), "%d", final_seconds);
     
     TAKE_MUTEX() {
         // Show brewing elements for flashing
@@ -192,13 +211,16 @@ static void stop_brewing(void) {
     }
     
     // Ensure timer is running for flash effect
-    if (g_update_timer) {
-        if (g_timer_paused) {
-            lv_timer_resume(g_update_timer);
-            g_timer_paused = false;
+    TAKE_MUTEX() {
+        if (g_update_timer) {
+            if (g_timer_paused) {
+                lv_timer_resume(g_update_timer);
+                g_timer_paused = false;
+            }
+            // Set period to 50ms for smooth flash toggling
+            lv_timer_set_period(g_update_timer, 50);
         }
-        // Set period to 50ms for smooth flash toggling
-        lv_timer_set_period(g_update_timer, 50);
+        GIVE_MUTEX();
     }
     
     brewing_debugln("[Brewing] Entered flashing state - will restore UI after 3 seconds");
@@ -234,6 +256,11 @@ void brewing_display_update(bool is_brewing, int64_t brewing_start_time) {
     if (is_brewing) {
         // Start brewing
         if (brewing_start_time <= 0) {
+            if (brewing_state_snapshot() == BREWING_STATE_ACTIVE) {
+                // A partial dashboard frame may omit brewingStartTime. Keep
+                // the established shot epoch instead of resetting the timer.
+                return;
+            }
             // Use current time if no start time provided (GPIO simulation case)
             brewing_start_time = brewing_display_get_current_time_ms();
         }
@@ -249,8 +276,9 @@ void brewing_display_update(bool is_brewing, int64_t brewing_start_time) {
  */
 void brewing_display_timer_callback(lv_timer_t* timer) {
     if (!g_initialized) return;
-    
-    switch (g_state) {
+
+    const BrewingState state = brewing_state_snapshot();
+    switch (state) {
         case BREWING_STATE_ACTIVE:
             // Update elapsed time during brewing
             update_elapsed_time_display();
@@ -259,13 +287,31 @@ void brewing_display_timer_callback(lv_timer_t* timer) {
         case BREWING_STATE_FLASHING:
             // Handle flashing effect
             {
-                unsigned long elapsed = millis() - g_flash_start_time;
+                portENTER_CRITICAL(&g_state_mux);
+                const unsigned long flash_start_time =
+                    g_flash_start_time;
+                portEXIT_CRITICAL(&g_state_mux);
+                unsigned long elapsed = millis() - flash_start_time;
                 
                 if (elapsed >= FLASH_DURATION_MS) {
+                    bool completed_flash = false;
+                    portENTER_CRITICAL(&g_state_mux);
+                    if (g_state == BREWING_STATE_FLASHING &&
+                        g_flash_start_time == flash_start_time) {
+                        g_final_seconds = 0;
+                        g_state = BREWING_STATE_IDLE;
+                        completed_flash = true;
+                    }
+                    portEXIT_CRITICAL(&g_state_mux);
+
+                    // A new shot may have started after this timer snapshotted
+                    // FLASHING. Never let the old callback clobber it.
+                    if (!completed_flash) {
+                        break;
+                    }
+
                     // Flash duration complete - return to idle and restore normal UI
                     brewing_debugln("[Brewing] Flash complete (3 seconds) - returning to normal UI");
-                    g_state = BREWING_STATE_IDLE;
-                    g_final_seconds = 0;
                     
                     // Restore normal UI (timer callback already has mutex, so use no-mutex version)
                     restore_normal_ui_no_mutex();
@@ -323,12 +369,16 @@ void brewing_display_timer_callback(lv_timer_t* timer) {
  * Optimized: Only updates text if value changed to reduce unnecessary redraws.
  */
 static void update_elapsed_time_display(void) {
-    if (g_brewing_start_time <= 0) {
+    portENTER_CRITICAL(&g_state_mux);
+    const int64_t brewing_start_time = g_brewing_start_time;
+    portEXIT_CRITICAL(&g_state_mux);
+
+    if (brewing_start_time <= 0) {
         return;
     }
     
     int64_t now_ms = brewing_display_get_current_time_ms();
-    int64_t elapsed_ms = now_ms - g_brewing_start_time;
+    int64_t elapsed_ms = now_ms - brewing_start_time;
     
     if (elapsed_ms < 0) {
         elapsed_ms = 0;
@@ -554,13 +604,26 @@ int64_t brewing_display_get_current_time_ms(void) {
     return (int64_t)tv.tv_sec * 1000LL + (int64_t)tv.tv_usec / 1000LL;
 }
 
+static BrewingState brewing_state_snapshot(void) {
+    portENTER_CRITICAL(&g_state_mux);
+    const BrewingState state = g_state;
+    portEXIT_CRITICAL(&g_state_mux);
+    return state;
+}
+
 /**
  * Check if brewing mode is currently active
  * Returns true for BOTH active brewing and flashing states
  * This ensures normal UI stays hidden during the entire brewing sequence
  */
 bool brewing_display_is_active(void) {
-    return g_initialized && (g_state == BREWING_STATE_ACTIVE || g_state == BREWING_STATE_FLASHING);
+    if (!g_initialized) {
+        return false;
+    }
+
+    const BrewingState state = brewing_state_snapshot();
+    return state == BREWING_STATE_ACTIVE ||
+           state == BREWING_STATE_FLASHING;
 }
 
 /**
@@ -603,30 +666,38 @@ void brewing_display_check_gpio_simulation(void) {
                 brewing_debugln("[Brewing] ========================================");
                 
                 // If we're in flashing state, skip it and go directly to idle
-                if (g_state == BREWING_STATE_FLASHING) {
+                BrewingState state = brewing_state_snapshot();
+                if (state == BREWING_STATE_FLASHING) {
                     brewing_debugln("[Brewing] Skipping flash - GPIO released during flash");
-                    g_state = BREWING_STATE_IDLE;
-                    g_final_seconds = 0;
+                    bool stopped_flashing = false;
+                    portENTER_CRITICAL(&g_state_mux);
+                    if (g_state == BREWING_STATE_FLASHING) {
+                        g_final_seconds = 0;
+                        g_state = BREWING_STATE_IDLE;
+                        stopped_flashing = true;
+                    }
+                    portEXIT_CRITICAL(&g_state_mux);
+
+                    if (!stopped_flashing) {
+                        return;
+                    }
                     
                     // Pause timer first
-                    if (g_update_timer && !g_timer_paused) {
-                        lv_timer_pause(g_update_timer);
-                        g_timer_paused = true;
+                    TAKE_MUTEX() {
+                        if (g_update_timer && !g_timer_paused) {
+                            lv_timer_pause(g_update_timer);
+                            g_timer_paused = true;
+                        }
+                        GIVE_MUTEX();
                     }
                     
                     // Restore normal UI
                     restore_normal_ui();
-                } else if (g_state == BREWING_STATE_ACTIVE) {
+                } else if (state == BREWING_STATE_ACTIVE) {
                     // Stop brewing (will enter flashing state, then restore after 3 seconds)
                     g_allow_update_from_gpio = true;
                     brewing_display_update(false, 0);
                     // Timer will continue running to handle flashing state
-                } else {
-                    // Already idle, just ensure UI is restored
-                    if (g_state != BREWING_STATE_IDLE) {
-                        g_state = BREWING_STATE_IDLE;
-                        restore_normal_ui();
-                    }
                 }
             }
         }
@@ -634,7 +705,10 @@ void brewing_display_check_gpio_simulation(void) {
     
     // If GPIO simulation is active, ensure brewing mode stays active
     // But allow flashing state to complete if GPIO was released
-    if (g_gpio_simulation_active && g_state != BREWING_STATE_ACTIVE && g_state != BREWING_STATE_FLASHING) {
+    const BrewingState state = brewing_state_snapshot();
+    if (g_gpio_simulation_active &&
+        state != BREWING_STATE_ACTIVE &&
+        state != BREWING_STATE_FLASHING) {
         // Re-enter brewing mode if somehow we exited it (but not if we're flashing)
         g_allow_update_from_gpio = true;
         int64_t current_time = brewing_display_get_current_time_ms();

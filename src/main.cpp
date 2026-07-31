@@ -14,7 +14,14 @@
 #include "boiler_display.h"
 #include "water_alarm.h"
 #include "brewing_display.h"
-#include "activity_monitor.h"
+#include "display_power.h"
+#include "ui_theme.h"
+
+#if __has_include("local_credentials.h")
+#include "local_credentials.h"
+#else
+#define LOCAL_CREDENTIALS_ENABLED 0
+#endif
 
 Preferences preferences;
 LaMarzoccoClient* g_client = nullptr;
@@ -23,16 +30,71 @@ LaMarzoccoMachine* g_machine = nullptr;
 
 LilyGo_Class amoled;
 SemaphoreHandle_t gui_mutex;
+SemaphoreHandle_t ui_ready_semaphore;
+static volatile bool ui_ready = false;
 void Task_LVGL(void *pvParameters);
 void updateSerialLoggingPowerState(bool force);
+
+static bool loadScreenThreadSafe(lv_obj_t *screen)
+{
+  if (!ui_ready || !screen || !gui_mutex) {
+    return false;
+  }
+
+  if (xSemaphoreTake(gui_mutex, portMAX_DELAY) != pdTRUE) {
+    return false;
+  }
+
+  lv_disp_load_scr(screen);
+  xSemaphoreGive(gui_mutex);
+  return true;
+}
 
 // WiFi connection variables
 const int MAX_WIFI_RETRIES = 10;
 const int WIFI_TIMEOUT_MS = 15000;
 
+static void storePreferenceIfChanged(const char *key, const char *value)
+{
+  if (!value || value[0] == '\0') {
+    return;
+  }
+
+  if (preferences.getString(key, "") != value) {
+    preferences.putString(key, value);
+  }
+}
+
+static void applyLocalCredentials()
+{
+#if LOCAL_CREDENTIALS_ENABLED
+  const bool has_local_wifi =
+      LOCAL_WIFI_SSID[0] != '\0' && LOCAL_WIFI_PASSWORD[0] != '\0';
+  const bool has_saved_wifi =
+      preferences.getString("SSID", "").length() > 0 &&
+      preferences.getString("PASS", "").length() > 0;
+
+  // Preserve a working captive-portal configuration. The local WiFi values
+  // are recovery defaults only, so changing networks remains possible.
+  if (has_local_wifi && !has_saved_wifi) {
+    storePreferenceIfChanged("SSID", LOCAL_WIFI_SSID);
+    storePreferenceIfChanged("PASS", LOCAL_WIFI_PASSWORD);
+    Serial.println("[CONFIG] Restored missing WiFi credentials");
+  }
+
+  // A local private build is authoritative for the cloud account. This also
+  // repairs stale or partially saved portal values on every boot.
+  storePreferenceIfChanged("USER_EMAIL", LOCAL_LM_EMAIL);
+  storePreferenceIfChanged("USER_PASS", LOCAL_LM_PASSWORD);
+  storePreferenceIfChanged("MACHINE", LOCAL_MACHINE_SERIAL);
+  Serial.println("[CONFIG] Applied local cloud credentials");
+#endif
+}
+
 bool connectToWiFi(const String &ssid, const String &password)
 {
-  debugln("Attempting to connect to WiFi...");
+  Serial.print("[WIFI] Connecting to saved network: ");
+  Serial.println(ssid);
   WiFi.begin(ssid.c_str(), password.c_str());
   WiFi.setSleep(false);
   int retries = 0;
@@ -45,19 +107,111 @@ bool connectToWiFi(const String &ssid, const String &password)
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    debugln("");
-    debugln("WiFi connected!");
-    debug("IP address: ");
-    debugln(WiFi.localIP());
+    Serial.println("[WIFI] Connected");
+    Serial.print("[WIFI] IP address: ");
+    Serial.println(WiFi.localIP());
     return true;
   }
   else
   {
-    debugln("");
-    debugln("Failed to connect to WiFi");
+    Serial.println(
+      "[WIFI] Saved network did not connect within 15 seconds; "
+      "credentials retained");
     WiFi.disconnect();
     return false;
   }
+}
+
+static bool initializeMachineFromStoredCredentials(bool connectImmediately)
+{
+  if (g_machine) {
+    return true;
+  }
+
+  String email = preferences.getString("USER_EMAIL", "");
+  String password = preferences.getString("USER_PASS", "");
+  String machine_serial = preferences.getString("MACHINE", "");
+  if (email.length() == 0 ||
+      password.length() == 0 ||
+      machine_serial.length() == 0) {
+    Serial.println("[CLOUD] Stored account configuration is incomplete");
+    return false;
+  }
+
+  InstallationKey key;
+  if (!LaMarzoccoAuth::load_installation_key(preferences, key)) {
+    Serial.println("[CLOUD] Generating a new installation key");
+
+    // Clear only incomplete/legacy installation-key material. WiFi and account
+    // credentials use different keys and are never touched here.
+    if (preferences.isKey("INSTALLATION_ID")) preferences.remove("INSTALLATION_ID");
+    if (preferences.isKey("INSTALLATION_SECRET")) preferences.remove("INSTALLATION_SECRET");
+    if (preferences.isKey("INSTALLATION_PRIVKEY")) preferences.remove("INSTALLATION_PRIVKEY");
+    if (preferences.isKey("INSTALLATION_PUBKEY")) preferences.remove("INSTALLATION_PUBKEY");
+    if (preferences.isKey("INSTALLATION_PRIVKEY_LEN")) preferences.remove("INSTALLATION_PRIVKEY_LEN");
+    if (preferences.isKey("INSTALLATION_PUBKEY_LEN")) preferences.remove("INSTALLATION_PUBKEY_LEN");
+    if (preferences.isKey("INST_ID")) preferences.remove("INST_ID");
+    if (preferences.isKey("INST_SECRET")) preferences.remove("INST_SECRET");
+    if (preferences.isKey("INST_PRIVKEY")) preferences.remove("INST_PRIVKEY");
+    if (preferences.isKey("INST_PUBKEY")) preferences.remove("INST_PUBKEY");
+    if (preferences.isKey("INST_PRIVLEN")) preferences.remove("INST_PRIVLEN");
+    if (preferences.isKey("INST_PUBLEN")) preferences.remove("INST_PUBLEN");
+
+    String installation_id = LaMarzoccoAuth::generate_uuid();
+    if (!LaMarzoccoAuth::generate_installation_key(installation_id, key) ||
+        !LaMarzoccoAuth::save_installation_key(preferences, key)) {
+      Serial.println("[CLOUD] Failed to create installation key");
+      showNoConnectionScreen(
+        "Client Init Failed!\n"
+        "Please restart WiFi Setup"
+      );
+      setupWEB();
+      return false;
+    }
+  }
+
+  g_client = new LaMarzoccoClient(preferences);
+  if (!g_client ||
+      !g_client->init(email, password, machine_serial)) {
+    Serial.println("[CLOUD] Failed to initialize client");
+    delete g_client;
+    g_client = nullptr;
+    showNoConnectionScreen(
+      "Client Init Failed!\n"
+      "Please restart WiFi Setup"
+    );
+    setupWEB();
+    return false;
+  }
+
+  g_websocket = new LaMarzoccoWebSocket(*g_client);
+  if (!g_websocket) {
+    delete g_client;
+    g_client = nullptr;
+    return false;
+  }
+
+  g_machine = new LaMarzoccoMachine(*g_client, *g_websocket);
+  if (!g_machine) {
+    delete g_websocket;
+    g_websocket = nullptr;
+    delete g_client;
+    g_client = nullptr;
+    return false;
+  }
+
+  Serial.println("[CLOUD] La Marzocco client initialized");
+  g_machine->request_stats_refresh();
+
+  if (connectImmediately) {
+    Serial.println("[CLOUD] Starting WebSocket connection");
+    if (!g_machine->connect_websocket()) {
+      Serial.println(
+        "[CLOUD] Initial connection unavailable; automatic retry is active");
+    }
+  }
+
+  return true;
 }
 
 void updateSerialLoggingPowerState(bool force)
@@ -82,37 +236,11 @@ void updateSerialLoggingPowerState(bool force)
   }
 }
 
-//function to enter deep sleep mode.  This helps to save power when device not in use and using a battery.
-void enterDeepSleep() {
-    Serial.println("Preparing to sleep...");
-    
-    // 1. Turn off the display so you know it worked
-    amoled.setBrightness(0);
-    
-    // 2. CRITICAL: Wait for button release!
-    // This loop blocks the code until you let go of the button.
-    // Otherwise, the device sleeps and wakes up instantly.
-    while (digitalRead(0) == LOW) {
-        delay(10);
-    }
-    
-    // 3. Small debounce delay to ensure the signal is clean
-    delay(100);
-
-    Serial.println("Goodnight!");
-
-    // 4. Configure Wakeup Source
-    // Wake up when GPIO 0 goes LOW (Pressed again)
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
-    
-    // 5. Enter Deep Sleep
-    esp_deep_sleep_start();
-}
-
 void setup()
 {
   Serial.begin(115200);
   preferences.begin("config", false);
+  applyLocalCredentials();
   pinMode(0, INPUT_PULLUP);
 
   bool rslt = false;
@@ -129,23 +257,39 @@ void setup()
     }
   }
 
+  if (!display_power_init(&amoled,
+                          DISPLAY_BRIGHTNESS_ACTIVE,
+                          DISPLAY_BRIGHTNESS_DIM,
+                          USER_DIM_TIMEOUT_MS)) {
+    Serial.println("Display power manager initialization failed");
+  }
+
   updateSerialLoggingPowerState(true);
 
   gui_mutex = xSemaphoreCreateMutex();
-  if (gui_mutex == NULL)
+  ui_ready_semaphore = xSemaphoreCreateBinary();
+  if (gui_mutex == NULL || ui_ready_semaphore == NULL)
   {
-    // Handle semaphore creation failure
-    log_i("gui_mutex semaphore creation failure");
+    log_i("UI synchronization primitive creation failure");
     return;
   }
 
-  xTaskCreatePinnedToCore(Task_LVGL,
-                          "Task_LVGL",
-                          1024 * 16,  // Increased for crypto operations
-                          NULL,
-                          3,
-                          NULL,
-                          0);
+  BaseType_t task_created =
+      xTaskCreatePinnedToCore(Task_LVGL,
+                             "Task_LVGL",
+                             1024 * 16,
+                             NULL,
+                             3,
+                             NULL,
+                             0);
+  if (task_created != pdPASS) {
+    log_i("LVGL task creation failure");
+    return;
+  }
+
+  // No screen object may be accessed from the network/setup core until LVGL
+  // has created the complete UI and its supporting display modules.
+  xSemaphoreTake(ui_ready_semaphore, portMAX_DELAY);
 
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
   delay(500);
@@ -154,129 +298,43 @@ void setup()
   String pass = preferences.getString("PASS", "");
   if (ssid == "" || pass == "")
   {
-    debugln("No WiFi credentials found, starting WiFi setup");
-    lv_disp_load_scr(ui_NoConnectionScreen);
+    Serial.println("[WIFI] No saved credentials");
+    showNoConnectionScreen(
+      "No Saved WiFi\n"
+      "Please start WiFi Setup"
+    );
     setupWEB();
   }
   else
   {
-    debugln("Found WiFi credentials");
-    if (connectToWiFi(ssid, pass))
-    {
-      lv_disp_load_scr(ui_mainScreen);
-      
-      // Initialize La Marzocco client
-      String email = preferences.getString("USER_EMAIL", "");
-      String password = preferences.getString("USER_PASS", "");
-      String machine_serial = preferences.getString("MACHINE", "");
-      
-      if (email.length() > 0 && password.length() > 0 && machine_serial.length() > 0) {
-        debugln("Initializing La Marzocco client...");
-        
-        // Check if installation key exists, if not generate it first
-        InstallationKey key;
-        if (!LaMarzoccoAuth::load_installation_key(preferences, key)) {
-          debugln("Generating installation key...");
-          
-          // Clear any partial keys that might exist (check before removing to avoid errors)
-          if (preferences.isKey("INSTALLATION_ID")) preferences.remove("INSTALLATION_ID");
-          if (preferences.isKey("INSTALLATION_SECRET")) preferences.remove("INSTALLATION_SECRET");
-          if (preferences.isKey("INSTALLATION_PRIVKEY")) preferences.remove("INSTALLATION_PRIVKEY");
-          if (preferences.isKey("INSTALLATION_PUBKEY")) preferences.remove("INSTALLATION_PUBKEY");
-          if (preferences.isKey("INSTALLATION_PRIVKEY_LEN")) preferences.remove("INSTALLATION_PRIVKEY_LEN");
-          if (preferences.isKey("INSTALLATION_PUBKEY_LEN")) preferences.remove("INSTALLATION_PUBKEY_LEN");
-          if (preferences.isKey("INST_ID")) preferences.remove("INST_ID");
-          if (preferences.isKey("INST_SECRET")) preferences.remove("INST_SECRET");
-          if (preferences.isKey("INST_PRIVKEY")) preferences.remove("INST_PRIVKEY");
-          if (preferences.isKey("INST_PUBKEY")) preferences.remove("INST_PUBKEY");
-          if (preferences.isKey("INST_PRIVLEN")) preferences.remove("INST_PRIVLEN");
-          if (preferences.isKey("INST_PUBLEN")) preferences.remove("INST_PUBLEN");
-          
-          String installation_id = LaMarzoccoAuth::generate_uuid();
-          if (LaMarzoccoAuth::generate_installation_key(installation_id, key)) {
-            if (LaMarzoccoAuth::save_installation_key(preferences, key)) {
-              debugln("Installation key generated and saved");
-            } else {
-              debugln("Failed to save installation key");
-            }
-          } else {
-            debugln("Failed to generate installation key");
-          }
-        } else {
-          debugln("Installation key found");
-        }
-        
-        g_client = new LaMarzoccoClient(preferences);
-        if (g_client->init(email, password, machine_serial)) {
-          // Register client if needed
-          debugln("Registering client...");
-          if (!g_client->register_client()) {
-            debugln("Registration failed - will retry on first API call");
-            // Note: Registration failures are not critical, will retry during API calls
-          }
-          
-          // Try to get access token (authenticate)
-          if (!g_client->get_access_token()) {
-            debugln("Authorization failed - invalid credentials");
-            
+    Serial.println("[WIFI] Saved credentials found");
+    setWiFiRecoveryCredentials(ssid, pass);
+    // Arm recovery before any blocking cloud startup work can run. If the
+    // initial association succeeds, the first monitor pass simply clears this
+    // provisional state.
+    startWiFiRecovery(false);
+    const bool wifi_connected = connectToWiFi(ssid, pass);
 
-            showNoConnectionScreen(
-              "Authorization Failed!\n"
-              "Invalid credentials\n"
-              "Please restart WiFi Setup"
-            );
-            
-            delete g_client;
-            g_client = nullptr;
-            setupWEB();
-          } else {
-            // Initialize websocket and machine
-            g_websocket = new LaMarzoccoWebSocket(*g_client);
-            g_machine = new LaMarzoccoMachine(*g_client, *g_websocket);
-            
-            debugln("La Marzocco client initialized");
-
-            // Initial refresh of coffee/flush counters
-            g_machine->request_stats_refresh();
-            
-            // Auto-connect WebSocket on startup
-            debugln("Auto-connecting to WebSocket...");
-            if (g_machine->connect_websocket()) {
-              debugln("✓ WebSocket connection initiated on startup");
-            } else {
-              debugln("✗ Failed to initiate WebSocket connection on startup");
-              // Note: WebSocket failures are not critical, will retry automatically
-            }
-          }
-        } else {
-          debugln("Failed to initialize La Marzocco client");
-          
-          showNoConnectionScreen(
-            "Client Init Failed!\n"
-            "Missing installation key\n"
-            "Please restart WiFi Setup"
-          );
-          
-          delete g_client;
-          g_client = nullptr;
-          setupWEB();
-        }
-      } else {
-        debugln("Missing La Marzocco credentials");
-        // Note: Missing credentials is expected on first run, no error message needed
-      }
-    }
-    else
-    {
-      debugln("WiFi connection failed after retries, starting WiFi setup");
-      lv_disp_load_scr(ui_NoConnectionScreen);
+    if (wifi_connected) {
+      loadScreenThreadSafe(ui_mainScreen);
+    } else {
+      showNoConnectionScreen(
+        "Saved WiFi Unavailable\n"
+        "Retrying automatically"
+      );
       setupWEB();
+      startWiFiRecovery(true);
     }
+
+    // Client construction is local-only. Creating it even while WiFi is down
+    // lets the normal machine loop authenticate automatically after recovery.
+    initializeMachineFromStoredCredentials(wifi_connected);
   }
 }
 
 void loop()
 {
+  serviceWEBSetupRequest();
   updateDateTime();
   updateStatusImages();  // Update battery and WiFi images (initial + every 30 seconds)
   checkWiFiConnection(); // Monitor WiFi connection and redirect if disconnected
@@ -287,92 +345,28 @@ void loop()
   
   // Handle websocket and machine loop - MUST be called frequently
   // WebSocket requires regular loop() calls to process messages
-  if (g_machine) {
+  if (g_machine && !isWEBActive()) {
     g_machine->loop();  // This calls websocket.loop()
   }
   
   // Small delay to prevent watchdog issues, but keep loop responsive
   delay(10);
-  
-  // Fast reconnection check (every 5 seconds)
-  static unsigned long last_check = 0;
-  static unsigned long last_reconnect_attempt = 0;
-  static const unsigned long CHECK_INTERVAL = 5000;     // Check every 5 seconds
-  static const unsigned long RECONNECT_INTERVAL = 10000; // Try reconnect every 10 seconds
-  
-  if (millis() - last_check > CHECK_INTERVAL) {
-    last_check = millis();
-    if (g_machine) {
-      if (g_machine->is_websocket_connected()) {
-        // Connected - only log occasionally to reduce noise
-        static unsigned long last_log = 0;
-        if (millis() - last_log > 60000) { // Log every 60 seconds when connected
-          Serial.println("[STATUS] ✓ WebSocket connected");
-          last_log = millis();
-        }
-      } else {
-        // Disconnected - try to reconnect quickly
-        if (millis() - last_reconnect_attempt > RECONNECT_INTERVAL) {
-          last_reconnect_attempt = millis();
-          Serial.println("[RECONNECT] WebSocket disconnected, reconnecting...");
-          
-          // Try to reconnect
-          if (g_machine->connect_websocket()) {
-            Serial.println("[RECONNECT] ✓ Reconnection initiated");
-          } else {
-            Serial.println("[RECONNECT] ✗ Reconnection failed, will retry in 10s");
-          }
-        }
-      }
-    }
-  }
 
-  static bool display_dimmed = false;
-  unsigned long last_user_ms = activity_monitor_last_user_ms();
-  unsigned long last_machine_ms = activity_monitor_last_machine_ms();
-  unsigned long now = millis();
-  bool user_dim_inactive = (USER_DIM_TIMEOUT_MS > 0) &&
-                           (now >= last_user_ms) &&
-                           (static_cast<uint32_t>(now - last_user_ms) >= USER_DIM_TIMEOUT_MS);
-  bool machine_dim_inactive = (MACHINE_DIM_TIMEOUT_MS > 0) &&
-                              (now >= last_machine_ms) &&
-                              (static_cast<uint32_t>(now - last_machine_ms) >= MACHINE_DIM_TIMEOUT_MS);
-  bool should_dim = user_dim_inactive && machine_dim_inactive;
-  if (should_dim && !display_dimmed) {
-    amoled.setBrightness(DISPLAY_BRIGHTNESS_DIM);
-    display_dimmed = true;
-  } else if (!should_dim && display_dimmed) {
-    amoled.setBrightness(DISPLAY_BRIGHTNESS_ACTIVE);
-    display_dimmed = false;
+  // The BOOT button is now only an optional display wake source. Deep sleep is
+  // intentionally disabled so Wi-Fi and machine events remain available.
+  static bool boot_was_pressed = false;
+  const bool boot_pressed = digitalRead(0) == LOW;
+  if (boot_pressed && !boot_was_pressed) {
+    display_power_mark_user_activity();
   }
-
-  bool user_inactive = activity_monitor_is_user_inactive(now);
-  bool machine_inactive = activity_monitor_is_machine_inactive(now);
-  if (user_inactive && machine_inactive) {
-    Serial.print("[SLEEP] Inactivity timeout: ");
-    Serial.println("user + machine");
-    enterDeepSleep();
-  }
-  // Check if BOOT button (GPIO 0) is held down to turn OFF
-    // (GPIO 0 is LOW when pressed)
-    if (digitalRead(0) == LOW) {
-        delay(100); // Debounce
-        unsigned long startTime = millis();
-        
-        // Wait to see if user holds it for 2 seconds
-        while (digitalRead(0) == LOW) {
-            if (millis() - startTime > 2000) {
-                // User held it for 2 seconds -> SLEEP
-                enterDeepSleep(); 
-            }
-        }
-    }
+  boot_was_pressed = boot_pressed;
 }
 
 void Task_LVGL(void *pvParameters)
 {
   beginLvglHelper(amoled);
   ui_init();
+  ui_theme_apply();
   
   // Initialize boiler display system after UI is ready
   boiler_display_set_mutex((void*)gui_mutex);  // Set mutex for thread-safe LVGL access
@@ -385,12 +379,18 @@ void Task_LVGL(void *pvParameters)
   // Initialize brewing display system
   brewing_display_set_mutex((void*)gui_mutex);
   brewing_display_init();
+
+  ui_ready = true;
+  xSemaphoreGive(ui_ready_semaphore);
   
   // Main LVGL loop
   while (1)
   {
     if (xSemaphoreTake(gui_mutex, portMAX_DELAY) == pdTRUE)
     {
+      // Brightness changes share this task with panel flushes, preventing QSPI
+      // display traffic from racing a redraw on the other ESP32 core.
+      display_power_loop();
       lv_timer_handler();
       xSemaphoreGive(gui_mutex);
     }

@@ -6,15 +6,13 @@
 #include <ArduinoJson.h>
 #include "lamarzocco_auth.h"
 #include "Preferences.h"
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
 
 struct AccessToken {
     String access_token;
     String refresh_token;
     unsigned long expires_at;  // Unix timestamp in seconds
-    
-    bool isValid() const {
-        return access_token.length() > 0 && expires_at > (unsigned long)(millis() / 1000);
-    }
 };
 
 class LaMarzoccoClient {
@@ -44,7 +42,10 @@ public:
     String get_serial_number() const { return _serial_number; }
     
     // Get access token string (for websocket)
-    String get_access_token_string() const { return _access_token.access_token; }
+    String get_access_token_string() const;
+
+    // Force the next authenticated operation to refresh/sign in again.
+    void invalidate_access_token();
     
 private:
     Preferences& _prefs;
@@ -54,12 +55,24 @@ private:
     String _password;
     String _serial_number;
     bool _initialized;
+    bool _registered;
     WiFiClientSecure _client;
+    SemaphoreHandle_t _request_mutex;
     
     // Internal helpers
+    bool _register_client_unlocked();
+    bool _get_access_token_unlocked();
     bool _sign_in();
     bool _refresh_token();
-    bool _make_request(const String& method, const String& url, JsonDocument* request_body, JsonDocument* response_body, bool needs_auth);
+    bool _force_reauthenticate();
+    bool _api_call_once(const String& method,
+                        const String& url,
+                        JsonDocument* request_body,
+                        JsonDocument* response_body,
+                        int& http_code);
+    bool _parse_token_response(const String& response, bool refresh_response);
+    bool _take_request_lock() const;
+    void _release_request_lock() const;
+    void _configure_http(HTTPClient& http);
     void _add_auth_headers(HTTPClient& http);
 };
-

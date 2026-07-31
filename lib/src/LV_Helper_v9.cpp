@@ -8,6 +8,7 @@
  */
 #include <Arduino.h>
 #include "LV_Helper.h"
+#include "display_power.h"
 
 #if LVGL_VERSION_MAJOR == 9
 
@@ -38,14 +39,24 @@ static void disp_flush( lv_display_t *disp_drv, const lv_area_t *area, uint8_t *
 static void touchpad_read( lv_indev_t *indev, lv_indev_data_t *data )
 {
     static int16_t x, y;
+    static bool suppress_until_release = false;
     auto *plane = (LilyGo_Display *)lv_indev_get_user_data(indev);
     uint8_t touched = plane->getPoint(&x, &y, 1);
     if ( touched ) {
+        display_power_mark_user_activity();
         data->point.x = x;
         data->point.y = y;
+
+        if (suppress_until_release || display_power_wake_if_dimmed()) {
+            suppress_until_release = true;
+            data->state = LV_INDEV_STATE_REL;
+            return;
+        }
+
         data->state = LV_INDEV_STATE_PR;
         return;
     }
+    suppress_until_release = false;
     data->state = LV_INDEV_STATE_REL;
 }
 

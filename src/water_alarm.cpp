@@ -1,5 +1,6 @@
 #include "water_alarm.h"
 #include "brewing_display.h"  // Need to check brewing state
+#include "display_power.h"
 #include "ui/ui.h"
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
@@ -19,9 +20,10 @@
 static bool g_initialized = false;
 static bool g_alarm_active = false;
 static SemaphoreHandle_t g_gui_mutex = NULL;
+static portMUX_TYPE g_alarm_mux = portMUX_INITIALIZER_UNLOCKED;
 
 // Helper macro for mutex protection
-#define TAKE_MUTEX() if (g_gui_mutex && xSemaphoreTake(g_gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE)
+#define TAKE_MUTEX() if (g_gui_mutex && xSemaphoreTake(g_gui_mutex, portMAX_DELAY) == pdTRUE)
 #define GIVE_MUTEX() if (g_gui_mutex) xSemaphoreGive(g_gui_mutex)
 
 
@@ -57,7 +59,9 @@ void water_alarm_init(void) {
     }
     
     g_initialized = true;
+    portENTER_CRITICAL(&g_alarm_mux);
     g_alarm_active = false;
+    portEXIT_CRITICAL(&g_alarm_mux);
     water_debugln("[WaterAlarm] Initialization complete");
 }
 
@@ -70,12 +74,27 @@ void water_alarm_set(bool alarm_active) {
         return;
     }
     
-    // Only update if state changed
-    if (g_alarm_active == alarm_active) {
+    if (!g_gui_mutex) {
         return;
     }
-    
-    g_alarm_active = alarm_active;
+
+    // The state is read by the LVGL core while dashboard updates arrive on the
+    // network core. Publish it atomically; the blocking GUI lock below ensures
+    // the corresponding one-shot visual transition cannot be dropped.
+    portENTER_CRITICAL(&g_alarm_mux);
+    const bool unchanged = g_alarm_active == alarm_active;
+    if (!unchanged) {
+        g_alarm_active = alarm_active;
+    }
+    portEXIT_CRITICAL(&g_alarm_mux);
+
+    if (unchanged) {
+        return;
+    }
+
+    if (alarm_active) {
+        display_power_mark_machine_activity();
+    }
     
     water_debug("[WaterAlarm] Setting alarm state to: ");
     water_debugln(alarm_active ? "ACTIVE" : "INACTIVE");
@@ -211,6 +230,8 @@ void water_alarm_set(bool alarm_active) {
  * Get current water alarm state
  */
 bool water_alarm_is_active(void) {
-    return g_alarm_active;
+    portENTER_CRITICAL(&g_alarm_mux);
+    const bool active = g_alarm_active;
+    portEXIT_CRITICAL(&g_alarm_mux);
+    return active;
 }
-

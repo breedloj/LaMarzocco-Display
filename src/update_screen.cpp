@@ -4,12 +4,16 @@
 #include <ui/ui.h>
 #include "WiFi.h"
 #include "config.h"
+#include "display_power.h"
+#include "web.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/semphr.h>
 
 unsigned long timeUpdate = 0;
 unsigned long statusUpdate = 0;
 bool statusImagesInitialized = false;
+static bool cloudConnectionErrorShown = false;
+static bool reconnectErrorShown = false;
 
 // External mutex from main.cpp
 extern SemaphoreHandle_t gui_mutex;
@@ -17,13 +21,21 @@ extern SemaphoreHandle_t gui_mutex;
 
 bool updateDateTime(void)
 {
-    if ( WiFi.isConnected() && (millis() - timeUpdate <= TIME_UPDATE))
+    const unsigned long now = millis();
+    if (now - timeUpdate < TIME_UPDATE) {
         return false;
+    }
+
+    // Rate-limit failed NTP/time reads as well as successful ones. Without
+    // this, a Wi-Fi outage retries getLocalTime() on every 10 ms main-loop pass.
+    timeUpdate = now;
 
     struct tm timeinfo;
     setenv("TZ","PST8PDT,M3.2.0,M11.1.0",1);
     tzset();
-    if (!getLocalTime(&timeinfo))
+    time_t current_time = time(nullptr);
+    if (current_time < 1000000000 ||
+        localtime_r(&current_time, &timeinfo) == nullptr)
     {
         log_e("Failed to obtain time");
         return false;
@@ -42,12 +54,11 @@ bool updateDateTime(void)
             timeinfo.tm_min);
 
     // Update label with mutex protection
-    if (gui_mutex && xSemaphoreTake(gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (gui_mutex && xSemaphoreTake(gui_mutex, portMAX_DELAY) == pdTRUE) {
         lv_label_set_text(ui_timeLabel, timeStr);
         xSemaphoreGive(gui_mutex);
     }
 
-    timeUpdate = millis();
     return true;
 }
 
@@ -168,12 +179,15 @@ void updateWiFiImages(void)
     }
 }
 
-// Combined function to update both battery and WiFi images
+// Refresh the live status icon without redrawing it on every main-loop pass.
 void updateStatusImages(void)
 {
+    static const unsigned long STATUS_UPDATE_INTERVAL_MS = 30000;
+
     // Check if enough time has passed since last update (30 seconds)
     // OR if this is the first initialization
-    if (!statusImagesInitialized || (millis() - statusUpdate >= TIME_UPDATE))
+    if (!statusImagesInitialized ||
+        (millis() - statusUpdate >= STATUS_UPDATE_INTERVAL_MS))
     {
         updateWiFiImages();
         
@@ -182,13 +196,13 @@ void updateStatusImages(void)
     }
 }
 
-void updateShotCounters(uint32_t coffee_count, uint32_t flush_count)
+bool updateShotCounters(uint32_t coffee_count, uint32_t flush_count)
 {
     static uint32_t last_coffee_count = UINT32_MAX;
     static uint32_t last_flush_count = UINT32_MAX;
 
     if (coffee_count == last_coffee_count && flush_count == last_flush_count) {
-        return;
+        return true;
     }
 
     char coffee_str[16];
@@ -196,18 +210,22 @@ void updateShotCounters(uint32_t coffee_count, uint32_t flush_count)
     snprintf(coffee_str, sizeof(coffee_str), "%lu", static_cast<unsigned long>(coffee_count));
     snprintf(flush_str, sizeof(flush_str), "%lu", static_cast<unsigned long>(flush_count));
 
-    if (gui_mutex && xSemaphoreTake(gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (ui_CoffeeCountLabel) {
-            lv_label_set_text(ui_CoffeeCountLabel, coffee_str);
-        }
-        if (ui_FlushCountLabel) {
-            lv_label_set_text(ui_FlushCountLabel, flush_str);
-        }
-        xSemaphoreGive(gui_mutex);
+    if (!gui_mutex ||
+        xSemaphoreTake(gui_mutex, portMAX_DELAY) != pdTRUE) {
+        return false;
     }
+
+    if (ui_CoffeeCountLabel) {
+        lv_label_set_text(ui_CoffeeCountLabel, coffee_str);
+    }
+    if (ui_FlushCountLabel) {
+        lv_label_set_text(ui_FlushCountLabel, flush_str);
+    }
+    xSemaphoreGive(gui_mutex);
 
     last_coffee_count = coffee_count;
     last_flush_count = flush_count;
+    return true;
 }
 
 // Show NoConnectionScreen with custom error message
@@ -215,8 +233,19 @@ void updateShotCounters(uint32_t coffee_count, uint32_t flush_count)
 // Usage example: showNoConnectionScreen("WiFi Disconnected!\nPlease reconnect");
 void showNoConnectionScreen(const char* errorMessage)
 {
+    // Generic/startup/Wi-Fi errors take ownership of this screen and must not
+    // later be cleared by an unrelated cloud recovery.
+    cloudConnectionErrorShown = false;
+    // Generic callers are not automatically owned by WiFi recovery. The WiFi
+    // state machine explicitly claims ownership after setting its message.
+    reconnectErrorShown = false;
+
+    // Authentication and prolonged connection failures are actionable and
+    // should not remain hidden on a dimmed display.
+    display_power_mark_machine_activity();
+
     // LVGL calls with mutex protection
-    if (gui_mutex && xSemaphoreTake(gui_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    if (gui_mutex && xSemaphoreTake(gui_mutex, portMAX_DELAY) == pdTRUE) {
         // Check if we're already on NoConnectionScreen to avoid recursive screen loading
         if (lv_scr_act() != ui_NoConnectionScreen)
         {
@@ -233,6 +262,48 @@ void showNoConnectionScreen(const char* errorMessage)
     }
 }
 
+void showCloudConnectionScreen(void)
+{
+    if (cloudConnectionErrorShown) {
+        return;
+    }
+
+    reconnectErrorShown = false;
+    cloudConnectionErrorShown = true;
+    display_power_mark_machine_activity();
+
+    if (gui_mutex &&
+        xSemaphoreTake(gui_mutex, portMAX_DELAY) == pdTRUE) {
+        if (lv_scr_act() != ui_NoConnectionScreen) {
+            lv_disp_load_scr(ui_NoConnectionScreen);
+        }
+        if (ui_ErrorLabel) {
+            lv_label_set_text(
+                ui_ErrorLabel,
+                "Cloud Connection Unavailable\n"
+                "Retrying automatically");
+        }
+        xSemaphoreGive(gui_mutex);
+    }
+}
+
+void clearCloudConnectionScreen(void)
+{
+    if (!cloudConnectionErrorShown || !WiFi.isConnected()) {
+        return;
+    }
+
+    if (gui_mutex &&
+        xSemaphoreTake(gui_mutex, portMAX_DELAY) == pdTRUE) {
+        if (lv_scr_act() == ui_NoConnectionScreen) {
+            lv_disp_load_scr(ui_mainScreen);
+            display_power_mark_machine_activity();
+        }
+        xSemaphoreGive(gui_mutex);
+    }
+    cloudConnectionErrorShown = false;
+}
+
 // WiFi connection monitoring with retry mechanism
 // Checks if WiFi is connected, attempts reconnection with retries before showing error
 static bool wasConnected = false;
@@ -241,11 +312,39 @@ static unsigned long reconnectStartTime = 0;
 static unsigned long waitUntilTime = 0;
 static const unsigned long WIFI_CHECK_INTERVAL = 5000;       // Check every 5 seconds
 static const unsigned long WIFI_RECONNECT_DELAY = 30000;     // 30 seconds between retry attempts
+static const unsigned long WIFI_RETRY_BATCH_DELAY = 60000;   // Back off after each five attempts
 static const unsigned long WIFI_CONNECT_TIMEOUT = 15000;     // 15 seconds to wait for connection
-static const int MAX_RECONNECT_ATTEMPTS = 5;                 // Maximum retry attempts
+static const int MAX_RECONNECT_ATTEMPTS = 5;                 // Attempts before slower retry cadence
 static int reconnectAttempts = 0;
 static bool isReconnecting = false;
 static bool waitingForConnection = false;
+static String recoverySSID;
+static String recoveryPassword;
+
+static bool deadlineReached(unsigned long now, unsigned long deadline)
+{
+    return static_cast<int32_t>(now - deadline) >= 0;
+}
+
+void setWiFiRecoveryCredentials(const String& ssid,
+                                const String& password)
+{
+    recoverySSID = ssid;
+    recoveryPassword = password;
+}
+
+void startWiFiRecovery(bool errorScreenShown)
+{
+    if (recoverySSID.length() == 0) {
+        return;
+    }
+
+    isReconnecting = true;
+    waitingForConnection = false;
+    reconnectAttempts = 0;
+    waitUntilTime = millis();
+    reconnectErrorShown = errorScreenShown;
+}
 
 void checkWiFiConnection(void)
 {
@@ -259,19 +358,43 @@ void checkWiFiConnection(void)
             isReconnecting = false;
             waitingForConnection = false;
             reconnectAttempts = 0;
+            display_power_mark_machine_activity();
+
+            // Return from the runtime connection-error screen automatically.
+            // Do not override the setup screen if the user deliberately opened
+            // it while Wi-Fi was unavailable.
+            bool returnedToMain = false;
+            if (reconnectErrorShown && gui_mutex &&
+                xSemaphoreTake(gui_mutex, portMAX_DELAY) == pdTRUE) {
+                if (lv_scr_act() == ui_NoConnectionScreen) {
+                    lv_disp_load_scr(ui_mainScreen);
+                    returnedToMain = true;
+                }
+                xSemaphoreGive(gui_mutex);
+            }
+            reconnectErrorShown = false;
+
+            // The setup portal is only a fallback. Close its open hotspot once
+            // automatic recovery succeeds, unless the user has already entered
+            // the setup flow and may be editing credentials.
+            if (returnedToMain) {
+                stopWEB();
+            }
         }
         wasConnected = true;
         return;
     }
     
     // WiFi is disconnected - handle reconnection logic
-    if (!isConnected && wasConnected) {
+    if (!isConnected && (wasConnected || isReconnecting)) {
         // First time detecting disconnection
         if (!isReconnecting) {
             Serial.println("⚠ WiFi disconnected! Starting reconnection attempts...");
             isReconnecting = true;
             reconnectAttempts = 0;
-            waitUntilTime = 0;  // Start immediately
+            // Use a deadline relative to the current uptime. A literal zero
+            // is ambiguous to wrap-safe signed comparisons after ~24.9 days.
+            waitUntilTime = currentMillis;
             waitingForConnection = false;
         }
         
@@ -284,19 +407,20 @@ void checkWiFiConnection(void)
                 
                 // Check if we've exhausted all retry attempts
                 if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
-                    Serial.println("❌ All reconnection attempts failed!");
-                    Serial.println("Showing NoConnectionScreen...");
-                    
-                    isReconnecting = false;
+                    Serial.println(
+                        "❌ WiFi retry batch failed; continuing automatically");
                     reconnectAttempts = 0;
-                    wasConnected = false;
-                    
-                    showNoConnectionScreen(
-                        "WiFi Connection Lost!\n"
-                        "Failed to reconnect\n"
-                        "after 5 attempts.\n"
-                        "Please restart WiFi"
-                    );
+                    waitUntilTime =
+                        currentMillis + WIFI_RETRY_BATCH_DELAY;
+
+                    if (!reconnectErrorShown) {
+                        showNoConnectionScreen(
+                            "WiFi Connection Lost!\n"
+                            "Retrying automatically"
+                        );
+                        reconnectErrorShown = true;
+                        setupWEB();
+                    }
                 } else {
                     // Schedule next attempt in 30 seconds
                     waitUntilTime = currentMillis + WIFI_RECONNECT_DELAY;
@@ -314,7 +438,7 @@ void checkWiFiConnection(void)
         }
         
         // If it's time to attempt reconnection
-        if (currentMillis >= waitUntilTime) {
+        if (deadlineReached(currentMillis, waitUntilTime)) {
             reconnectAttempts++;
             
             Serial.print("🔄 Reconnection attempt ");
@@ -322,8 +446,16 @@ void checkWiFiConnection(void)
             Serial.print(" of ");
             Serial.println(MAX_RECONNECT_ATTEMPTS);
             
-            // Attempt to reconnect
-            WiFi.reconnect();
+            // Retry the credentials loaded from Preferences at boot. Calling
+            // begin() explicitly remains deterministic even while the setup AP
+            // is also active.
+            if (recoverySSID.length() > 0) {
+                WiFi.begin(recoverySSID.c_str(),
+                           recoveryPassword.c_str());
+                WiFi.setSleep(false);
+            } else {
+                WiFi.reconnect();
+            }
             reconnectStartTime = currentMillis;
             waitingForConnection = true;
         }

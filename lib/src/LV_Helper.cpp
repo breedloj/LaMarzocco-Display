@@ -8,7 +8,7 @@
  */
 #include <Arduino.h>
 #include "LV_Helper.h"
-#include "activity_monitor.h"
+#include "display_power.h"
 
 
 #if LVGL_VERSION_MAJOR == 8
@@ -35,14 +35,25 @@ static void disp_flush( lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color
 static void touchpad_read( lv_indev_drv_t *indev_driver, lv_indev_data_t *data )
 {
     static int16_t x, y;
+    static bool suppress_until_release = false;
     uint8_t touched =   static_cast<LilyGo_Display *>(indev_driver->user_data)->getPoint(&x, &y, 1);
     if ( touched ) {
-        activity_monitor_mark_user_activity();
+        display_power_mark_user_activity();
         data->point.x = x;
         data->point.y = y;
+
+        // Consume the complete physical touch that wakes a dimmed display.
+        // Suppressing only one poll would let a held finger click on the next.
+        if (suppress_until_release || display_power_wake_if_dimmed()) {
+            suppress_until_release = true;
+            data->state = LV_INDEV_STATE_REL;
+            return;
+        }
+
         data->state = LV_INDEV_STATE_PR;
         return;
     }
+    suppress_until_release = false;
     data->state = LV_INDEV_STATE_REL;
 }
 
